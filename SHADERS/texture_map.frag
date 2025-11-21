@@ -1,37 +1,32 @@
 #version 450
 
 layout(location = 1) in vec2 fragTexCoord;
-
-// This binding points to our 'offscreenImage' (Pass 1 output)
 layout(binding = 1) uniform sampler2D sceneTexture;
-
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    // 1. Calculate size of a single texel
-    // textureSize returns the width/height of the image in pixels
-    // stepSize allows us to jump further to make the blur stronger (e.g., 1.0, 2.0, 3.0)
-    float stepSize = 3.0; 
+    // 1. Get Original
+    vec4 originalColor = texture(sceneTexture, fragTexCoord);
+
+    // 2. Box Blur
+    // INCREASED stepSize from 3.0 to 6.0 to make the blur spread wider
+    float stepSize = 6.0; 
     vec2 texelSize = stepSize / vec2(textureSize(sceneTexture, 0));
     
-    vec4 result = vec4(0.0);
-    
-    // 2. Convolution Loop (Box Blur)
-    // We sample a grid around the center pixel
-    // boxSize = 2 means a 5x5 grid (-2 to +2)
+    vec4 blurredColor = vec4(0.0);
     int boxSize = 6; 
 
     for (int x = -boxSize; x <= boxSize; x++) {
         for (int y = -boxSize; y <= boxSize; y++) {
-            // Offset coordinate by (x, y) texels
             vec2 offset = vec2(float(x), float(y)) * texelSize;
-            result += texture(sceneTexture, fragTexCoord + offset);
+            blurredColor += texture(sceneTexture, fragTexCoord + offset);
         }
     }
 
-    // 3. Average the result
-    // Total samples = width * height of the grid
     int totalSamples = (boxSize * 2 + 1) * (boxSize * 2 + 1);
-    
-    outColor = result / float(totalSamples);
+    blurredColor = blurredColor / float(totalSamples);
+
+    // 3. Additive Blending (Glow)
+    // INCREASED intensity from 0.8 to 2.0 to make it pop
+    outColor = originalColor + (blurredColor * 2.0);
 }
