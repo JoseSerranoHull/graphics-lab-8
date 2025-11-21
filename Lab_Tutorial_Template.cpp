@@ -274,6 +274,18 @@ private:
     VkDeviceMemory particleIndexBufferMemory;
     uint32_t particleIndexCount;
 
+    // --- Off-screen Resources (Pass 1 Output) ---
+    VkImage offscreenImage;
+    VkDeviceMemory offscreenImageMemory;
+    VkImageView offscreenImageView;
+    VkSampler offscreenSampler;
+
+    // --- Textured Cube Resources (Pass 2 Pipeline) ---
+    VkDescriptorSetLayout texturedCubeDescriptorSetLayout;
+    VkPipelineLayout texturedCubePipelineLayout;
+    VkPipeline texturedCubePipeline;
+    std::vector<VkDescriptorSet> texturedCubeDescriptorSets;
+
     // --- Main Flow ---
     void initWindow();
     void initVulkan();
@@ -306,7 +318,6 @@ private:
     void cleanupSwapChain();
     void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex);
     void updateUniformBuffer(uint32_t currentImage);
-
 
     // --- Helper Functions ---
     void populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& createInfo);
@@ -369,6 +380,11 @@ private:
     void createParticleResources();
 	void createParticlePipeline();
 
+    /* Off-screen Resources */
+    void createOffscreenResources();
+    void createTexturedCubePipeline();
+    void createTexturedCubeDescriptorSets();
+
     /* Helper functions */
     VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features);
     VkFormat findDepthFormat();
@@ -399,33 +415,34 @@ void HelloTriangleApplication::initVulkan() {
     createLogicalDevice();
     createSwapChain();
     createImageViews();
+    createOffscreenResources();
     createDescriptorSetLayout();
     createGraphicsPipeline();
 
-    // --- FIX: Move createCommandPool UP here ---
     createCommandPool();
 
-    // Skybox setup
+    // --- Resources & Pipelines ---
     createCubeMapResources();
     createSkyboxPipeline();
 
-	// Particle system setup
     createParticleResources();
     createParticlePipeline();
 
-    // loadModel();
+    // Move Textured Cube Pipeline here (it's safe to create the pipeline/layout early)
+    createTexturedCubePipeline();
 
-	// Texture mapping setup
+    // --- Buffers & Pools ---
+    // loadModel(); // (Commented out in your code)
+
+    // Texture/Normal/Height map setup
     createTextureImage();
     createTextureImageView();
     createTextureSampler();
 
-    // Mormal mapping setup
     createNormalMapImage();
     createNormalMapImageView();
     createNormalMapSampler();
 
-	// Height mapping setup
     createHeightMapImage();
     createHeightMapImageView();
     createHeightMapSampler();
@@ -484,9 +501,19 @@ void HelloTriangleApplication::initVulkan() {
     // createVertexBuffer();
     // createIndexBuffer();
     createUniformBuffers();
-    createDescriptorPool();
+    
+    // --- CRITICAL: Pool must be created BEFORE allocating sets ---
+    createDescriptorPool(); 
+
+    // --- Allocations ---
     createDescriptorSets();
     createSkyboxDescriptorSets();
+
+    // --- MOVE THIS HERE ---
+    // Now the pool exists, so we can allocate the sets!
+    createTexturedCubeDescriptorSets(); 
+    // ----------------------
+
     createCommandBuffers();
     createSyncObjects();
 
@@ -504,6 +531,32 @@ void HelloTriangleApplication::mainLoop() {
 }
 
 void HelloTriangleApplication::cleanup() {
+    // 1. Clean up swapchain-dependent resources 
+    // (This now includes the Offscreen Image/View/Sampler from Lab 8)
+    cleanupSwapChain();
+
+    // --- LAB 8: TEXTURED CUBE PIPELINE CLEANUP ---
+    vkDestroyPipeline(device, texturedCubePipeline, nullptr);
+    vkDestroyPipelineLayout(device, texturedCubePipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, texturedCubeDescriptorSetLayout, nullptr);
+    // ---------------------------------------------
+
+    // Lab 7: Clean up Skybox Pipeline
+    vkDestroyPipeline(device, skyboxPipeline, nullptr);
+    vkDestroyPipelineLayout(device, skyboxPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, skyboxDescriptorSetLayout, nullptr);
+
+    // Lab 7: Clean up Particle Pipeline
+    vkDestroyPipeline(device, particlePipeline, nullptr);
+    vkDestroyPipelineLayout(device, particlePipelineLayout, nullptr);
+
+    // Lab 7: Clean up Particle Buffers
+    vkDestroyBuffer(device, particleVertexBuffer, nullptr);
+    vkFreeMemory(device, particleVertexBufferMemory, nullptr);
+    vkDestroyBuffer(device, particleIndexBuffer, nullptr);
+    vkFreeMemory(device, particleIndexBufferMemory, nullptr);
+
+    // Clean up Meshes
     for (const auto& mesh : meshBuffers) {
         vkDestroyBuffer(device, mesh.vertexBuffer, nullptr);
         vkFreeMemory(device, mesh.vertexBufferMemory, nullptr);
@@ -512,15 +565,14 @@ void HelloTriangleApplication::cleanup() {
     }
     meshBuffers.clear();
 
-    cleanupSwapChain();
-
+    // Clean up Main Graphics Pipeline
     vkDestroyPipeline(device, graphicsPipeline, nullptr);
     vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
+    // Clean up Buffers
     vkDestroyBuffer(device, indexBuffer, nullptr);
     vkFreeMemory(device, indexBufferMemory, nullptr);
-
     vkDestroyBuffer(device, vertexBuffer, nullptr);
     vkFreeMemory(device, vertexBufferMemory, nullptr);
 
@@ -530,6 +582,7 @@ void HelloTriangleApplication::cleanup() {
     }
     vkDestroyDescriptorPool(device, descriptorPool, nullptr);
 
+    // Clean up Sync Objects
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
         vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
         vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
@@ -990,22 +1043,21 @@ void HelloTriangleApplication::createUniformBuffers() {
 void HelloTriangleApplication::createDescriptorPool() {
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
 
-    // 1. Uniform Buffers: We need 1 for the main object + 1 for the skybox (per frame)
+    // 1. Uniform Buffers: Main(2) + Skybox(2) + TexturedCube(2)
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 2;
+    poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 3; // Increased
 
-    // 2. Image Samplers: 3 for main object (Color, Normal, Height) + 1 for Skybox (per frame)
+    // 2. Image Samplers: Main(5) + Skybox(1) + TexturedCube(1)
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    // Change the multiplier from * 4 to * 5
-    poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 5;
+    poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 7; // Increased
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
 
-    // Max sets = Main Sets + Skybox Sets
-    poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 2;
+    // Max sets = Main + Skybox + TexturedCube
+    poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 3; // Increased
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create descriptor pool!");
@@ -1214,22 +1266,38 @@ void HelloTriangleApplication::recreateSwapChain() {
         glfwWaitEvents();
     }
     vkDeviceWaitIdle(device);
+
     cleanupSwapChain();
+
     createSwapChain();
     createImageViews();
     createDepthResources();
+
+    // --- LAB 8: RECREATE OFFSCREEN RESOURCES ---
+    createOffscreenResources();
+    // -------------------------------------------
 }
 
 void HelloTriangleApplication::cleanupSwapChain() {
+    // 1. Destroy Swapchain Image Views
     for (auto imageView : swapChainImageViews) {
         vkDestroyImageView(device, imageView, nullptr);
     }
 
-
+    // 2. Destroy Depth Resources
     vkDestroyImageView(device, depthImageView, nullptr);
     vkDestroyImage(device, depthImage, nullptr);
     vkFreeMemory(device, depthImageMemory, nullptr);
 
+    // --- LAB 8: DESTROY OFFSCREEN RESOURCES ---
+    // These depend on screen size, so they must go here
+    vkDestroySampler(device, offscreenSampler, nullptr);
+    vkDestroyImageView(device, offscreenImageView, nullptr);
+    vkDestroyImage(device, offscreenImage, nullptr);
+    vkFreeMemory(device, offscreenImageMemory, nullptr);
+    // ------------------------------------------
+
+    // 3. Destroy Swapchain
     vkDestroySwapchainKHR(device, swapChain, nullptr);
 }
 
@@ -1240,66 +1308,67 @@ void HelloTriangleApplication::recordCommandBuffer(VkCommandBuffer commandBuffer
         throw std::runtime_error("Failed to begin recording command buffer!");
     }
 
-    VkImageMemoryBarrier2 imageBarrierToAttachment{};
-    imageBarrierToAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    imageBarrierToAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-    imageBarrierToAttachment.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    imageBarrierToAttachment.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    imageBarrierToAttachment.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imageBarrierToAttachment.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    imageBarrierToAttachment.image = swapChainImages[imageIndex];
-    imageBarrierToAttachment.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    // ========================================================================
+    // PASS 1: Render Scene to Off-screen Texture
+    // ========================================================================
 
-    VkDependencyInfo dependencyInfoToAttachment{};
-    dependencyInfoToAttachment.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependencyInfoToAttachment.imageMemoryBarrierCount = 1;
-    dependencyInfoToAttachment.pImageMemoryBarriers = &imageBarrierToAttachment;
-    vkCmdPipelineBarrier2(commandBuffer, &dependencyInfoToAttachment);
+    // 1. Transition Offscreen Image to COLOR_ATTACHMENT_OPTIMAL
+    VkImageMemoryBarrier2 barrierToOffscreen{};
+    barrierToOffscreen.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrierToOffscreen.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT; // Was read in prev frame
+    barrierToOffscreen.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    barrierToOffscreen.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    barrierToOffscreen.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    barrierToOffscreen.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // We don't care about previous content
+    barrierToOffscreen.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrierToOffscreen.image = offscreenImage;
+    barrierToOffscreen.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-    VkRenderingAttachmentInfo colorAttachment{};
-    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAttachment.imageView = swapChainImageViews[imageIndex];
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = { {0.0f, 0.0f, 0.0f, 1.0f} };
+    VkDependencyInfo dependencyToOffscreen{};
+    dependencyToOffscreen.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyToOffscreen.imageMemoryBarrierCount = 1;
+    dependencyToOffscreen.pImageMemoryBarriers = &barrierToOffscreen;
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyToOffscreen);
 
+    // 2. Define Attachment Info for Offscreen Image
+    VkRenderingAttachmentInfo offscreenColorAttachment{};
+    offscreenColorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    offscreenColorAttachment.imageView = offscreenImageView;
+    offscreenColorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    offscreenColorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    offscreenColorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    offscreenColorAttachment.clearValue.color = { {0.1f, 0.1f, 0.1f, 1.0f} }; // Dark background for internal scene
+
+    // We reuse the depth buffer (clearing it)
     VkRenderingAttachmentInfo depthAttachment{};
     depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     depthAttachment.imageView = depthImageView;
     depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; // Clear depth!
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depthAttachment.clearValue.depthStencil = { 1.0f, 0 }; // 1.0f is max depth
+    depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
 
-    VkRenderingInfo renderingInfo{};
-    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    renderingInfo.renderArea = { {0, 0}, swapChainExtent };
-    renderingInfo.layerCount = 1;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachments = &colorAttachment;
-    renderingInfo.pDepthAttachment = &depthAttachment;
+    VkRenderingInfo offscreenRenderingInfo{};
+    offscreenRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    offscreenRenderingInfo.renderArea = { {0, 0}, swapChainExtent };
+    offscreenRenderingInfo.layerCount = 1;
+    offscreenRenderingInfo.colorAttachmentCount = 1;
+    offscreenRenderingInfo.pColorAttachments = &offscreenColorAttachment;
+    offscreenRenderingInfo.pDepthAttachment = &depthAttachment;
 
-    // Start Rendering
-    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    // 3. Render the "Internal" Scene
+    vkCmdBeginRendering(commandBuffer, &offscreenRenderingInfo);
 
-    // --- 1. DRAW SKYBOX FIRST ---
-    // We assume meshBuffers[0] is the CUBE we created in initVulkan
+    // --- Skybox ---
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipeline);
-
-    // Bind Skybox Descriptors
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipelineLayout, 0, 1, &skyboxDescriptorSets[currentFrame], 0, nullptr);
-
-    // Bind Cube Vertex/Index Buffers
     VkBuffer vertexBuffers[] = { meshBuffers[0].vertexBuffer };
     VkDeviceSize offsets[] = { 0 };
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
     vkCmdBindIndexBuffer(commandBuffer, meshBuffers[0].indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-    // Draw the Skybox Cube
     vkCmdDrawIndexed(commandBuffer, meshBuffers[0].indexCount, 1, 0, 0, 0);
 
-    // --- 2. DRAW SCENE OBJECTS ---
+    // --- Solid Objects (Normal Scene) ---
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
 
     VkViewport viewport{};
@@ -1314,9 +1383,6 @@ void HelloTriangleApplication::recordCommandBuffer(VkCommandBuffer commandBuffer
 
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
 
-    // Draw all meshes (including the cube again, but with the normal shader)
-    // Note: If you only want the skybox in the background and not a solid cube in the center,
-    // you might want to comment out drawing meshBuffers[0] here, or move meshBuffers[0] to a specific location.
     for (size_t i = 0; i < meshBuffers.size(); ++i) {
         VkBuffer vBuffers[] = { meshBuffers[i].vertexBuffer };
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vBuffers, offsets);
@@ -1327,50 +1393,127 @@ void HelloTriangleApplication::recordCommandBuffer(VkCommandBuffer commandBuffer
         material.diffuse = glm::vec3(1.0f, 1.0f, 1.0f);
         material.specular = glm::vec3(1.0f, 1.0f, 1.0f);
         material.shininess = 32.0f;
-
         vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(MaterialPushConstant), &material);
 
         vkCmdDrawIndexed(commandBuffer, meshBuffers[i].indexCount, 1, 0, 0, 0);
     }
 
-    // --- 3. DRAW PARTICLES ---
+    // --- Particles ---
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, particlePipeline);
-
-    // Bind Vertex/Index Buffers
     VkBuffer pVertBuffers[] = { particleVertexBuffer };
     VkDeviceSize pOffsets[] = { 0 };
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, pVertBuffers, pOffsets);
     vkCmdBindIndexBuffer(commandBuffer, particleIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-    // Bind UBO (We reuse the same descriptor set for View/Proj matrices!)
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, particlePipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
 
-    // Push Time Constant
     static auto startTime = std::chrono::high_resolution_clock::now();
     auto currentTime = std::chrono::high_resolution_clock::now();
     float time = std::chrono::duration<float>(currentTime - startTime).count();
     vkCmdPushConstants(commandBuffer, particlePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float), &time);
-
-    // Draw Particles
     vkCmdDrawIndexed(commandBuffer, particleIndexCount, 1, 0, 0, 0);
 
     vkCmdEndRendering(commandBuffer);
 
-    VkImageMemoryBarrier2 imageBarrierToPresent{};
-    imageBarrierToPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    imageBarrierToPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    imageBarrierToPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    imageBarrierToPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-    imageBarrierToPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    imageBarrierToPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    imageBarrierToPresent.image = swapChainImages[imageIndex];
-    imageBarrierToPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    // ========================================================================
+    // BARRIER: Transition Offscreen Image to SHADER_READ_ONLY
+    // ========================================================================
+    VkImageMemoryBarrier2 barrierToShaderRead{};
+    barrierToShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrierToShaderRead.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    barrierToShaderRead.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    barrierToShaderRead.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrierToShaderRead.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+    barrierToShaderRead.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrierToShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrierToShaderRead.image = offscreenImage;
+    barrierToShaderRead.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
-    VkDependencyInfo dependencyInfoToPresent{};
-    dependencyInfoToPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependencyInfoToPresent.imageMemoryBarrierCount = 1;
-    dependencyInfoToPresent.pImageMemoryBarriers = &imageBarrierToPresent;
-    vkCmdPipelineBarrier2(commandBuffer, &dependencyInfoToPresent);
+    VkDependencyInfo dependencyToShaderRead{};
+    dependencyToShaderRead.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyToShaderRead.imageMemoryBarrierCount = 1;
+    dependencyToShaderRead.pImageMemoryBarriers = &barrierToShaderRead;
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyToShaderRead);
+
+    // ========================================================================
+    // PASS 2: Render Textured Cube to Swapchain
+    // ========================================================================
+
+    // 1. Transition Swapchain to COLOR_ATTACHMENT
+    VkImageMemoryBarrier2 barrierToSwapchain{};
+    barrierToSwapchain.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrierToSwapchain.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    barrierToSwapchain.srcAccessMask = 0;
+    barrierToSwapchain.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    barrierToSwapchain.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    barrierToSwapchain.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrierToSwapchain.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrierToSwapchain.image = swapChainImages[imageIndex];
+    barrierToSwapchain.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo dependencyToSwapchain{};
+    dependencyToSwapchain.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyToSwapchain.imageMemoryBarrierCount = 1;
+    dependencyToSwapchain.pImageMemoryBarriers = &barrierToSwapchain;
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyToSwapchain);
+
+    // 2. Attachment Info for Swapchain
+    VkRenderingAttachmentInfo swapchainAttachment{};
+    swapchainAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    swapchainAttachment.imageView = swapChainImageViews[imageIndex];
+    swapchainAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    swapchainAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    swapchainAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    swapchainAttachment.clearValue.color = { {0.0f, 0.0f, 0.0f, 1.0f} };
+
+    // Clear depth again for the second pass!
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+
+    VkRenderingInfo finalRenderingInfo{};
+    finalRenderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    finalRenderingInfo.renderArea = { {0, 0}, swapChainExtent };
+    finalRenderingInfo.layerCount = 1;
+    finalRenderingInfo.colorAttachmentCount = 1;
+    finalRenderingInfo.pColorAttachments = &swapchainAttachment;
+    finalRenderingInfo.pDepthAttachment = &depthAttachment;
+
+    // 3. Render the Textured Cube
+    vkCmdBeginRendering(commandBuffer, &finalRenderingInfo);
+
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, texturedCubePipeline);
+
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    // Bind the new descriptor set that contains the offscreen texture!
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, texturedCubePipelineLayout, 0, 1, &texturedCubeDescriptorSets[currentFrame], 0, nullptr);
+
+    // Draw the cube (meshBuffers[0])
+    VkBuffer vBuffers2[] = { meshBuffers[0].vertexBuffer };
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vBuffers2, offsets);
+    vkCmdBindIndexBuffer(commandBuffer, meshBuffers[0].indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+    vkCmdDrawIndexed(commandBuffer, meshBuffers[0].indexCount, 1, 0, 0, 0);
+
+    vkCmdEndRendering(commandBuffer);
+
+    // ========================================================================
+    // Final Barrier: Transition Swapchain to PRESENT_SRC
+    // ========================================================================
+    VkImageMemoryBarrier2 barrierToPresent{};
+    barrierToPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrierToPresent.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    barrierToPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    barrierToPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+    barrierToPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrierToPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrierToPresent.image = swapChainImages[imageIndex];
+    barrierToPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    VkDependencyInfo dependencyToPresent{};
+    dependencyToPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyToPresent.imageMemoryBarrierCount = 1;
+    dependencyToPresent.pImageMemoryBarriers = &barrierToPresent;
+    vkCmdPipelineBarrier2(commandBuffer, &dependencyToPresent);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
         throw std::runtime_error("Failed to record command buffer!");
@@ -1407,6 +1550,232 @@ void HelloTriangleApplication::updateUniformBuffer(uint32_t currentImage) {
     ubo.lightColor2 = glm::vec4(1.0f, 1.0f, 1.0f, 1.0f); // Use vec4
 
     memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(UniformBufferObject));
+}
+
+// --- Offscreen Implementation ---
+void HelloTriangleApplication::createOffscreenResources() {
+    // 1. Create Image
+    // We match the SwapChain format and extent so it fits the screen
+    createImage(
+        swapChainExtent.width, swapChainExtent.height,
+        swapChainImageFormat,
+        VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, // Important flags! [cite: 52]
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        offscreenImage,
+        offscreenImageMemory
+    );
+
+    // 2. Create Image View
+    offscreenImageView = createImageView(offscreenImage, swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+
+    // 3. Create Sampler
+    // We use a standard linear sampler to read the texture later
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE; // Blur/Post-process usually doesn't need anisotropy
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &offscreenSampler) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create offscreen sampler!");
+    }
+}
+
+void HelloTriangleApplication::createTexturedCubePipeline() {
+    // 1. Descriptor Set Layout
+    VkDescriptorSetLayoutBinding uboLayoutBinding{};
+    uboLayoutBinding.binding = 0;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.descriptorCount = 1;
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+    samplerLayoutBinding.binding = 1;
+    samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    samplerLayoutBinding.descriptorCount = 1;
+    samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboLayoutBinding, samplerLayoutBinding };
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &texturedCubeDescriptorSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create textured cube descriptor set layout!");
+    }
+
+    // 2. Pipeline Layout
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &texturedCubeDescriptorSetLayout;
+
+    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &texturedCubePipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create textured cube pipeline layout!");
+    }
+
+    // 3. Shaders
+    auto vertShaderCode = readFile("shaders/textured_cube.vert.spv");
+    auto fragShaderCode = readFile("shaders/texture_map.frag.spv");
+
+    VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
+    VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+
+    VkPipelineShaderStageCreateInfo vertShaderStageInfo{};
+    vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertShaderStageInfo.module = vertShaderModule;
+    vertShaderStageInfo.pName = "main";
+
+    VkPipelineShaderStageCreateInfo fragShaderStageInfo{};
+    fragShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragShaderStageInfo.module = fragShaderModule;
+    fragShaderStageInfo.pName = "main";
+
+    VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
+
+    // 4. Vertex Input (Standard Vertex)
+    auto bindingDescription = Vertex::getBindingDescription();
+    auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+    vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+    vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
+    vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
+
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.depthClampEnable = VK_FALSE;
+    rasterizer.rasterizerDiscardEnable = VK_FALSE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo colorBlending{};
+    colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+
+    std::vector<VkDynamicState> dynamicStates = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    VkPipelineRenderingCreateInfo renderingCreateInfo{};
+    renderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    renderingCreateInfo.colorAttachmentCount = 1;
+    renderingCreateInfo.pColorAttachmentFormats = &swapChainImageFormat;
+    renderingCreateInfo.depthAttachmentFormat = depthFormat;
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.pNext = &renderingCreateInfo;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = texturedCubePipelineLayout;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &texturedCubePipeline) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create textured cube graphics pipeline!");
+    }
+
+    vkDestroyShaderModule(device, fragShaderModule, nullptr);
+    vkDestroyShaderModule(device, vertShaderModule, nullptr);
+}
+
+void HelloTriangleApplication::createTexturedCubeDescriptorSets() {
+    std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, texturedCubeDescriptorSetLayout);
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool;
+    allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    allocInfo.pSetLayouts = layouts.data();
+
+    texturedCubeDescriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+    if (vkAllocateDescriptorSets(device, &allocInfo, texturedCubeDescriptorSets.data()) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate textured cube descriptor sets!");
+    }
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        // Binding 0: UBO (Reuse main UBO)
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = uniformBuffers[i];
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(UniformBufferObject);
+
+        // Binding 1: Offscreen Image
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; // We will transition it to this state in drawFrame
+        imageInfo.imageView = offscreenImageView;
+        imageInfo.sampler = offscreenSampler;
+
+        std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+
+        descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[0].dstSet = texturedCubeDescriptorSets[i];
+        descriptorWrites[0].dstBinding = 0;
+        descriptorWrites[0].dstArrayElement = 0;
+        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrites[0].descriptorCount = 1;
+        descriptorWrites[0].pBufferInfo = &bufferInfo;
+
+        descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[1].dstSet = texturedCubeDescriptorSets[i];
+        descriptorWrites[1].dstBinding = 1;
+        descriptorWrites[1].dstArrayElement = 0;
+        descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        descriptorWrites[1].descriptorCount = 1;
+        descriptorWrites[1].pImageInfo = &imageInfo;
+
+        vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+    }
 }
 
 // --- Helper Implementations ---

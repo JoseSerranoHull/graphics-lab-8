@@ -188,6 +188,8 @@
     <None Include="SHADERS\particle.vert" />
     <None Include="SHADERS\skybox.frag" />
     <None Include="SHADERS\skybox.vert" />
+    <None Include="SHADERS\textured_cube.vert" />
+    <None Include="SHADERS\texture_map.frag" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
